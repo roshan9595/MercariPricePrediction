@@ -7,13 +7,15 @@ library(quanteda)
 library(stringr)
 library(tictoc)
 library(glue)
-library(data.table)
-library(ggplot2) 
-library(treemapify) 
-library(gridExtra) 
-library(dplyr) 
-library(tidyr) 
-library(tibble) 
+
+library(data.table) # Loading data
+library(ggplot2) # Data visualization
+library(treemapify) # Treemap visualization
+library(gridExtra) # Create multiplot
+library(dplyr) # data manipulation
+library(tidyr) # data manipulation
+library(tibble) # data wrangling
+library(stringr) # String processing
 library(repr)
 library(stringi) # String processing
 
@@ -21,7 +23,7 @@ library(stringi) # String processing
 setwd("/home/roshan/MercariPriceChallenge")
 
 
-data_cols <- cols(
+train_cols <- cols(
   train_id = col_integer(),
   name = col_character(),
   item_condition_id = col_integer(),
@@ -32,8 +34,17 @@ data_cols <- cols(
   item_description = col_character()
 )
 
+test_cols <- cols(
+  test_id = col_integer(),
+  name = col_character(),
+  item_condition_id = col_integer(),
+  category_name = col_character(),
+  brand_name = col_character(),
+  shipping = col_integer(),
+  item_description = col_character()
+)
 
-data <- read_tsv("train.tsv", col_types = data_cols)
+train <- read_tsv("train.tsv", col_types = train_cols)
 
 train = train %>% mutate(log_price = log(price+1))
 
@@ -205,31 +216,3 @@ set.seed(100)
 textplot_wordcloud(dfm1, min.freq = 3e4, random.order = FALSE,
                    rot.per = .25, 
                    colors = RColorBrewer::brewer.pal(8,"Dark2"))
-
-
-options(repr.plot.width=7, repr.plot.height=3.5)
-
-p1 = train %>%
-  ggplot(aes(x=item_condition_id, y=log_price, fill=item_condition_id)) +
-  geom_boxplot(outlier.size=0.1) +
-  ggtitle('Boxplot of Log Price versus Condition') +
-  theme(legend.position="none", plot.title = element_text(size=10))
-
-p2 = train %>%
-  ggplot(aes(x=shipping, y=log_price, fill=shipping)) +
-  geom_boxplot(width=0.5, outlier.size=0.1) +
-  ggtitle('Boxplot of Log Price versus Shipping') +
-  theme(legend.position="none", plot.title = element_text(size=10))
-
-grid.arrange(p1, p2, ncol=2)
-
-options(repr.plot.width=7, repr.plot.height=3.5)
-
-train %>%
-  ggplot(aes(x=cat1, y=log_price, fill=has_brand)) +
-  geom_boxplot(outlier.size=0.1) +
-  ggtitle('Boxplot of Log Price versus 1st Category') +
-  xlab('1st Category') +
-  theme(axis.text.x=element_text(angle=15, hjust=1))
-
-
