@@ -1,5 +1,8 @@
 rm(list=ls())
 
+
+library(ggplot2) # Data visualization
+library(readr) # CSV file I/O, e.g. the read_csv function
 library(Matrix)
 library(tidyverse)
 library(lightgbm)
@@ -7,23 +10,12 @@ library(quanteda)
 library(stringr)
 library(tictoc)
 library(glue)
-
-library(data.table) # Loading data
-library(ggplot2) # Data visualization
-library(treemapify) # Treemap visualization
-library(gridExtra) # Create multiplot
-library(dplyr) # data manipulation
-library(tidyr) # data manipulation
-library(tibble) # data wrangling
-library(stringr) # String processing
-library(repr)
-library(stringi) # String processing
-
+library(xgboost)
 #set current working directory
 setwd("/home/roshan/MercariPriceChallenge")
 
 
-train_cols <- cols(
+data_cols <- cols(
   train_id = col_integer(),
   name = col_character(),
   item_condition_id = col_integer(),
@@ -34,187 +26,224 @@ train_cols <- cols(
   item_description = col_character()
 )
 
-test_cols <- cols(
-  test_id = col_integer(),
-  name = col_character(),
-  item_condition_id = col_integer(),
-  category_name = col_character(),
-  brand_name = col_character(),
-  shipping = col_integer(),
-  item_description = col_character()
+
+data <- read_tsv("train.tsv", col_types = data_cols)
+
+data <- data %>%
+  filter(price != 0)
+
+data$price_log  <- log(data$price + 1)
+
+
+indexes = sample(1:nrow(data), size=0.3*nrow(data))
+
+# Split data
+df_test = data[indexes,]
+
+
+df_train = data[-indexes,]
+
+## Handling categories
+
+tic("Splitting categories")
+temp <- as_tibble(str_split(df_train$category_name, "/", n = 3, simplify = TRUE))
+names(temp) <- paste0("category", 1:3)
+df_train <- bind_cols(df_train, temp)
+
+temp <- as_tibble(str_split(df_test$category_name, "/", n = 3, simplify = TRUE))
+names(temp) <- paste0("category", 1:3)
+df_test <- bind_cols(df_test, temp)
+toc()
+
+# Cleaning and some new features
+tic("Data preprocessing")
+df_train <- df_train %>% 
+  mutate(item_description = if_else(is.na(item_description) | 
+                                      str_to_lower(item_description) == "no description yet", 
+                                    "nodescription", 
+                                    item_description),
+         desc_length = if_else(item_description == "nodescription", 0L, str_length(item_description)),
+         na_brand = is.na(brand_name),
+         brand_name = if_else(brand_name == "Céline", "Celine", brand_name)
+  )
+
+df_test <- df_test %>% 
+  mutate(item_description = if_else(is.na(item_description) | 
+                                      str_to_lower(item_description) == "no description yet", 
+                                    "nodescription", 
+                                    item_description),
+         desc_length = if_else(item_description == "nodescription", 0L, str_length(item_description)),
+         na_brand = is.na(brand_name),
+         brand_name = if_else(brand_name == "Céline", "Celine", brand_name)
+  )
+
+
+
+## Handling missing values
+
+df_train$category1[is.na(df_train$category1)] <- "missing" 
+df_train$category2[is.na(df_train$category2)] <- "missing" 
+df_train$category3[is.na(df_train$category3)] <- "missing" 
+
+df_test$category1[is.na(df_test$category1)] <- "missing" 
+df_test$category2[is.na(df_test$category2)] <- "missing" 
+df_test$category3[is.na(df_test$category3)] <- "missing" 
+
+
+df_train$brand_name[is.na(df_train$brand_name)] <- "missing"
+df_test$brand_name[is.na(df_test$brand_name)] <- "missing"
+
+
+df_train$category_name[is.na(df_train$category_name)] <- "missing"
+df_test$category_name[is.na(df_test$category_name)] <- "missing"
+
+toc()
+
+log_trainprices  <- df_train$price_log
+df_train$price_log <- NULL
+log_testprices  <- df_test$price_log
+df_test$price_log <- NULL
+
+
+all <-  rbind(df_train, df_test)
+
+tic("Descriptions dtm")
+descriptions <- corpus(char_tolower(all$item_description))
+
+description_tokens <- tokens(
+  tokens_remove(tokens(descriptions,   
+                       remove_numbers = FALSE, 
+                       remove_punct = TRUE,
+                       remove_symbols = TRUE, 
+                       remove_separators = TRUE), 
+                stopwords("english")), 
+  ngrams = 1:2
 )
 
-train <- read_tsv("train.tsv", col_types = train_cols)
 
-train = train %>% mutate(log_price = log(price+1))
+description_dtm <- dfm(
+  description_tokens
+)
+toc()
 
-head(train, 3)
+rmseEval=function(yTrain,yPred) {
+  mseEval=sum((yTrain - yPred)^2)/length(yTrain)
+  return(sqrt(mseEval)) }
 
-summary(train)
+tic("Descriptions tf-idf")
+description_dtm_trimmed <- dfm_trim(description_dtm, min_count = 600)
+description_tf_matrix <- dfm_tfidf(description_dtm_trimmed)
+toc()
 
-options(repr.plot.width=7, repr.plot.height=7)
+description_tf_matrix
 
-p1 = train %>% ggplot(aes(x=log_price)) +
-  geom_histogram(bins=30) +
-  ggtitle('Distributon of Log1p Price')
+tic("Names dtm")
+names <- corpus(char_tolower(all$name))
 
-p2 = train %>% ggplot(aes(x=price)) +
-  geom_histogram(bins=30) +
-  xlim(0,300) +
-  ggtitle('Distributon of Price')
-
-p3 = train %>% ggplot(aes(x=item_condition_id)) +
-  geom_bar() +
-  ggtitle('Distribution of Item Conditions') +
-  theme(legend.position="none")
-
-p4 = train %>% ggplot(aes(x=shipping)) +
-  geom_bar(width=0.5) +
-  ggtitle('Distribution of Shipping Info') +
-  theme(legend.position="none")
-
-suppressWarnings(grid.arrange(p1, p2, p3, p4, ncol=2))
-
-train = data.frame(train, str_split_fixed(train$category_name, '/', 4)) %>%
-  mutate(cat1=X1, cat2=X2, cat3=X3, cat4=X4) %>% select(-X1, -X2, -X3, -X4)
-
-train %>% summarise(Num_Cat1 = length(unique(cat1)), Num_Cat2 = length(unique(cat2)),
-                    Num_Cat3 = length(unique(cat3)), Num_Cat4 = length(unique(cat4)))
-
-options(repr.plot.width=7, repr.plot.height=7)
-
-train %>%
-  group_by(cat1, cat2) %>%
-  count() %>%
-  ungroup() %>%
-  ggplot(aes(area=n, fill=cat1, label=cat2, subgroup=cat1)) +
-  geom_treemap() +
-  geom_treemap_subgroup_text(grow = T, alpha = 0.5, colour =
-                               "black", fontface = "italic", min.size = 0) +
-  geom_treemap_text(colour = "white", place = "topleft", reflow = T) +
-  theme(legend.position = "null") +
-  ggtitle("1st and 2nd Hierarchical Category Levels")
-
-options(repr.plot.width=7, repr.plot.height=7)
-
-train %>% filter(cat1=='Women') %>% 
-  group_by(cat2, cat3) %>%
-  count() %>%
-  ungroup() %>%
-  ggplot(aes(area=n, fill=cat2, label=cat3, subgroup=cat2)) +
-  geom_treemap() +
-  geom_treemap_subgroup_text(grow = T, alpha = 0.5, colour =
-                               "black", fontface = "italic", min.size = 0) +
-  geom_treemap_text(colour = "white", place = "topleft", reflow = T) +
-  theme(legend.position = "null") +
-  ggtitle("2nd and 3rd Hierarchical Category Levels Under Woman")
-
-options(repr.plot.width=7, repr.plot.height=3.5)
-
-train = train %>% mutate(has_brand=(brand_name!=''))
-train %>%
-  ggplot(aes(x=cat1, fill=has_brand)) +
-  geom_bar(position='fill') +
-  theme(axis.text.x=element_text(angle=15, hjust=1, size=8)) +
-  xlab('1st Categories') +
-  ylab('Proportion') +
-  ggtitle('Items With and Without Brands')
+names_tokens <- tokens(
+  tokens_remove(tokens(names,    
+                       remove_numbers = TRUE, 
+                       remove_punct = TRUE,
+                       remove_symbols = TRUE, 
+                       remove_separators = TRUE), 
+                stopwords("english")), 
+  ngrams = 1
+  
+)
 
 
-options(repr.plot.width=7, repr.plot.height=3.5)
+names_dtm <- dfm(
+  names_tokens
+)
+toc()
 
-p1 = train %>% mutate(len_of_des = str_length(item_description)) %>%
-  ggplot(aes(x=len_of_des)) +
-  geom_histogram(bins=50) +
-  ggtitle('Distribution of Length of Descriptions') +
-  xlab('Length of Item Description') +
-  theme(plot.title = element_text(size=10))
+trimmed_names_dfm <- dfm_trim(names_dtm, min_count = 30)
 
-p2 = train %>% mutate(num_token_des = str_count(item_description, '\\S+')) %>% 
-  ggplot(aes(x=num_token_des)) +
-  geom_histogram(bins=50) +
-  ggtitle('Distribution of # of Tokens of Descriptions') +
-  xlab('Number of Tokens') +
-  theme(plot.title = element_text(size=10))
+tic("Preparing data for modelling")
+sparse_matrix <- sparse.model.matrix(
+  ~item_condition_id + 
+    shipping + 
+    na_brand + 
+    category1 + 
+    category2 + 
+    category3 + 
+    desc_length + 
+    brand_name,
+  data = all)
 
-grid.arrange(p1, p2, ncol=2)
+## Fix for cbind dfm and sparse matrix
+class(description_tf_matrix) <- class(sparse_matrix)
+class(trimmed_names_dfm) <- class(sparse_matrix)
 
-options(repr.plot.width=7, repr.plot.height=3.5)
+aaa <- cbind(
+  sparse_matrix, # basic features
+  description_tf_matrix,  # description
+  trimmed_names_dfm # name
+)
 
-train = train %>% mutate(num_token_name = str_count(name, '\\S+'))
-train %>%
-  ggplot(aes(x=num_token_name)) +
-  geom_bar(width=0.7) +
-  ggtitle('Distribution of # of Tokens of Names') +
-  xlab('Number of Words')
+rownames(aaa) <- NULL
 
+glue("Number of features: {dim(aaa)[2]}")
 
+sparse_train <- aaa[seq_len(nrow(df_train)), ]
+sparse_test  <- aaa[seq(from = (nrow(df_train) + 1), to = nrow(aaa)), ]
 
-options(repr.plot.width=7, repr.plot.height=3.5)
+dtrain <- lgb.Dataset(sparse_train, label=log_trainprices)
+toc()
+#XGBoost
+boost <- xgboost(data = sparse_train, label = log_trainprices, 
+                 eta = 0.1,
+                 max_depth = 16, 
+                 nround=2000, 
+                 subsample = 0.7,
+                 colsample_bytree = 0.5,
+                 seed = 333,
+                 eval_metric = "rmse",
+                 objective = "reg:linear",
+                 nthread = 4)
+log_answer <- predict(boost, sparse_test)
+print("XGBoost prediction R"+rmseEval(log_testprices,log_answer))
+predicted <- exp(log_answer) - 1
 
-p1 = train %>%
-  ggplot(aes(x=item_condition_id, y=log_price, fill=item_condition_id)) +
-  geom_boxplot(outlier.size=0.1) +
-  ggtitle('Boxplot of Log Price versus Condition') +
-  theme(legend.position="none", plot.title = element_text(size=10))
-
-p2 = train %>%
-  ggplot(aes(x=shipping, y=log_price, fill=shipping)) +
-  geom_boxplot(width=0.5, outlier.size=0.1) +
-  ggtitle('Boxplot of Log Price versus Shipping') +
-  theme(legend.position="none", plot.title = element_text(size=10))
-
-grid.arrange(p1, p2, ncol=2)
-
-options(repr.plot.width=7, repr.plot.height=3.5)
-
-train %>%
-  ggplot(aes(x=cat1, y=log_price, fill=has_brand)) +
-  geom_boxplot(outlier.size=0.1) +
-  ggtitle('Boxplot of Log Price versus 1st Category') +
-  xlab('1st Category') +
-  theme(axis.text.x=element_text(angle=15, hjust=1))
-
-options(repr.plot.width=7, repr.plot.height=7)
-
-train %>% mutate(len_of_des = str_length(item_description)) %>%
-  group_by(len_of_des) %>%
-  summarise(mean_log_price = mean(log_price)) %>% 
-  ggplot(aes(x=len_of_des, y=mean_log_price)) +
-  geom_point(size=0.5) +
-  geom_smooth(method = "loess", color = "red", size=0.5) +
-  ggtitle('Mean Log Price versus Length of Description')
-
-options(repr.plot.width=7, repr.plot.height=7)
-
-train %>% mutate(num_token_des = str_count(item_description, '\\S+')) %>%
-  group_by(num_token_des) %>%
-  summarise(mean_log_price = mean(log_price)) %>% 
-  ggplot(aes(x=num_token_des, y=mean_log_price)) +
-  geom_point(size=0.5) +
-  geom_smooth(method = "loess", color = "red", size=0.5) +
-  ggtitle('Mean Log Price versus # of Tokens of Description')
-
-ggplot(data = train, aes(x = as.factor(item_condition_id), y = log(price + 1))) + 
-  geom_boxplot(fill = 'cyan2', color = 'darkgrey')
-
-train %>%
-  ggplot(aes(x = log(price+1), fill = factor(shipping))) + 
-  geom_density(adjust = 2, alpha = 0.6) + 
-  labs(x = 'Log price', y = '', title = 'Distribution of price by shipping')
-
-dcorpus <- corpus(train$item_description)
-dfm1 <- dfm(
-  dcorpus, 
-  ngrams = 1, 
-  remove = c("rm", stopwords("english")),
-  remove_punct = TRUE,
-  remove_numbers = TRUE,
-  stem = TRUE)
-
-set.seed(100)
-textplot_wordcloud(dfm1, min.freq = 3e4, random.order = FALSE,
-                   rot.per = .25, 
-                   colors = RColorBrewer::brewer.pal(8,"Dark2"))
+results <- data.frame(
+  test_id = as.integer(seq_len(nrow(df_test)) - 1),
+  price = predicted
+)
+write_csv(results, "xgboostPrediction.csv")
 
 
+#LGBM
+nrounds <- 8000
+param <- list(
+  objective = "regression",
+  metric = "rmse"
+)
+
+set.seed(333)
+tic("Modelling")
+
+model <- lgb.train(
+  params = param,
+  data = dtrain,
+  nrounds = nrounds,
+  learning_rate = 1,
+  subsample = 0.7,
+  max_depth = 4,
+  eval_freq = 50,
+  verbose = -1,
+  nthread = 4
+)
+toc()
+
+tic("Predicting results")
+log_predicted <- predict(model, sparse_test)
+print("LGBM prediction R"+rmseEval(log_testprices,log_predicted))
+predicted <- exp(log_predicted) - 1
+
+results <- data.frame(
+  test_id = as.integer(seq_len(nrow(df_test)) - 1),
+  price = predicted
+)
+write_csv(results, "LGBMprediction.csv")
+
+toc()
